@@ -1,5 +1,12 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, try_to_timestamp
+from pyspark.sql.functions import (
+    col,
+    count,
+    from_json,
+    sum as spark_sum,
+    try_to_timestamp,
+    window,
+)
 from pyspark.sql.types import (
     IntegerType,
     LongType,
@@ -49,6 +56,28 @@ def read_orders(spark):
     )
 
 
+def calculate_metrics(orders):
+    return (
+        orders
+        .withWatermark("event_time", "2 minutes")
+        .groupBy(
+            window(col("event_time"), "1 minute"),
+            col("currency"),
+        )
+        .agg(
+            count("*").alias("order_count"),
+            spark_sum("amount_cents").alias("revenue_cents"),
+        )
+        .select(
+            col("window.start").alias("window_start"),
+            col("window.end").alias("window_end"),
+            col("currency"),
+            col("order_count"),
+            col("revenue_cents"),
+        )
+    )
+
+
 def main():
     spark = (
         SparkSession.builder
@@ -63,17 +92,18 @@ def main():
 
     try:
         orders = read_orders(spark)
+        metrics = calculate_metrics(orders)
 
         query = (
-            orders.writeStream
-            .queryName("orders_preview")
+            metrics.writeStream
+            .queryName("orders_metrics")
             .format("console")
-            .outputMode("append")
+            .outputMode("update")
             .option("truncate", "false")
             .option("numRows", 20)
             .option(
                 "checkpointLocation",
-                "/opt/spark/work-dir/checkpoints/orders-preview-v1",
+                "/opt/spark/work-dir/checkpoints/orders-metrics-v1",
             )
             .trigger(processingTime="5 seconds")
             .start()
