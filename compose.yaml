@@ -25,6 +25,33 @@ services:
       retries: 12
       start_period: 20s
 
+  postgres:
+    image: postgres:17.11
+    cpus: 1
+    mem_limit: 512m
+    environment:
+      POSTGRES_DB: streaming_metrics
+      POSTGRES_USER: metrics
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      TZ: UTC
+    command: ["postgres", "-c", "timezone=UTC"]
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - type: bind
+        source: ./sql/001_create_metrics.sql
+        target: /docker-entrypoint-initdb.d/001_create_metrics.sql
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "metrics", "-d", "streaming_metrics"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
   spark:
     image: apache/spark:4.0.4-python3
     cpus: 2
@@ -36,7 +63,12 @@ services:
       SPARK_LOCAL_IP: "127.0.0.1"
       PYSPARK_PYTHON: python3
     volumes:
-      - ./stream_processor.py:/opt/spark/app/stream_processor.py:ro
+      - type: bind
+        source: ./stream_processor.py
+        target: /opt/spark/app/stream_processor.py
+        read_only: true
+        bind:
+          create_host_path: false
       - spark_work:/opt/spark/work-dir
     command:
       - /opt/spark/bin/spark-submit
@@ -53,3 +85,4 @@ services:
 volumes:
   redpanda_data:
   spark_work:
+  postgres_data:
