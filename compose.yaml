@@ -25,5 +25,31 @@ services:
       retries: 12
       start_period: 20s
 
+  spark:
+    image: apache/spark:4.0.4-python3
+    cpus: 2
+    mem_limit: 1536m
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      SPARK_LOCAL_IP: "127.0.0.1"
+      PYSPARK_PYTHON: python3
+    volumes:
+      - ./stream_processor.py:/opt/spark/app/stream_processor.py:ro
+      - spark_work:/opt/spark/work-dir
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - --driver-memory
+      - 512m
+      - --conf
+      - spark.jars.ivy=/opt/spark/work-dir/ivy
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.4
+      - /opt/spark/app/stream_processor.py
+
 volumes:
   redpanda_data:
+  spark_work:
