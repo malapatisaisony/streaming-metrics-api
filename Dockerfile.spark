@@ -1,0 +1,15 @@
+FROM apache/spark:4.0.4-python3
+
+USER root
+
+COPY requirements-spark.txt /opt/spark/requirements-spark.txt
+
+RUN python3 -m pip install --no-cache-dir \
+    --target /opt/spark/python-deps \
+    -r /opt/spark/requirements-spark.txt
+
+ENV PYTHONPATH=/opt/spark/python-deps
+
+USER spark
+
+RUN python3 -c "import psycopg; print(psycopg.__version__)"

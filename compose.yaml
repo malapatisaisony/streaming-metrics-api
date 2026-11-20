@@ -53,15 +53,26 @@ services:
       start_period: 20s
 
   spark:
-    image: apache/spark:4.0.4-python3
+    image: streaming-metrics-spark:dev
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
     cpus: 2
     mem_limit: 1536m
     depends_on:
       redpanda:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       SPARK_LOCAL_IP: "127.0.0.1"
       PYSPARK_PYTHON: python3
+      TZ: UTC
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: streaming_metrics
+      PGUSER: metrics
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - type: bind
         source: ./stream_processor.py
