@@ -56,6 +56,16 @@ ORDER BY SUM(order_count) DESC, customer_id ASC
 LIMIT %s
 """
 
+ANOMALY_COUNTS_SQL = """
+SELECT
+    COALESCE(SUM(order_count) FILTER (WHERE window_start >= %s), 0) AS order_count,
+    COALESCE(SUM(order_count) FILTER (WHERE window_start < %s), 0) AS baseline_count
+FROM public.order_metrics
+WHERE currency = %s
+  AND window_start >= %s
+  AND window_start < %s
+"""
+
 
 class MinuteMetric(BaseModel):
     window_start: datetime
@@ -88,6 +98,20 @@ class TopCustomers(BaseModel):
     currency: str
     items: list[CustomerOrderCount]
 
+
+class OrderVolumeAnomaly(BaseModel):
+    window_start: datetime
+    window_end: datetime
+    currency: str
+    order_count: int
+    baseline_start: datetime
+    baseline_avg_orders: float
+    threshold: int
+    is_anomaly: bool
+
+
+ANOMALY_BASELINE_MINUTES = 5
+ANOMALY_MULTIPLIER = 2
 
 CACHE_TTL_SECONDS = 5
 CACHE_MAX_PAGES = 128
@@ -142,7 +166,10 @@ def fetch_metric_rows(query: str, params: tuple):
         ) from exc
 
 
-def five_minute_bounds(at_minute: datetime | None) -> tuple[datetime, datetime]:
+def minute_window_bounds(
+    at_minute: datetime | None,
+    minutes: int,
+) -> tuple[datetime, datetime]:
     reference_time = at_minute or datetime.now(timezone.utc)
 
     try:
@@ -150,7 +177,7 @@ def five_minute_bounds(at_minute: datetime | None) -> tuple[datetime, datetime]:
             second=0, microsecond=0
         )
         window_end = minute_start + timedelta(minutes=1)
-        return window_end - timedelta(minutes=5), window_end
+        return window_end - timedelta(minutes=minutes), window_end
     except OverflowError as exc:
         raise HTTPException(
             status_code=422,
@@ -216,7 +243,7 @@ def get_rolling_order_count(
         Query(description="Last minute to include. Defaults to the current UTC minute."),
     ] = None,
 ):
-    window_start, window_end = five_minute_bounds(at_minute)
+    window_start, window_end = minute_window_bounds(at_minute, minutes=5)
 
     rows = fetch_metric_rows(ROLLING_COUNT_SQL, (currency, window_start, window_end))
     return {
@@ -236,7 +263,7 @@ def get_top_customers(
     ] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 5,
 ):
-    window_start, window_end = five_minute_bounds(at_minute)
+    window_start, window_end = minute_window_bounds(at_minute, minutes=5)
     rows = fetch_metric_rows(
         TOP_CUSTOMERS_SQL,
         (currency, window_start, window_end, limit),
@@ -247,4 +274,49 @@ def get_top_customers(
         "window_end": window_end,
         "currency": currency,
         "items": rows,
+    }
+
+
+@app.get("/metrics/anomaly", response_model=OrderVolumeAnomaly)
+def get_order_volume_anomaly(
+    currency: Annotated[str, Query(pattern=r"^[A-Z]{3}$")] = "USD",
+    at_minute: Annotated[
+        AwareDatetime | None,
+        Query(description="Minute to check. Defaults to the most recently ended UTC minute."),
+    ] = None,
+    min_orders: Annotated[
+        int,
+        Query(ge=1, description="Minimum order count needed to flag a spike."),
+    ] = 10,
+):
+    reference_time = at_minute or (datetime.now(timezone.utc) - timedelta(minutes=1))
+    baseline_start, window_end = minute_window_bounds(
+        reference_time,
+        minutes=ANOMALY_BASELINE_MINUTES + 1,
+    )
+    window_start = window_end - timedelta(minutes=1)
+
+    row = fetch_metric_rows(
+        ANOMALY_COUNTS_SQL,
+        (window_start, window_start, currency, baseline_start, window_end),
+    )[0]
+    order_count = int(row["order_count"])
+    baseline_count = int(row["baseline_count"])
+    baseline_avg = baseline_count / ANOMALY_BASELINE_MINUTES
+
+    # Round twice the baseline average up to a whole number of orders.
+    relative_threshold = (
+        ANOMALY_MULTIPLIER * baseline_count + ANOMALY_BASELINE_MINUTES - 1
+    ) // ANOMALY_BASELINE_MINUTES
+    threshold = max(min_orders, relative_threshold)
+
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+        "currency": currency,
+        "order_count": order_count,
+        "baseline_start": baseline_start,
+        "baseline_avg_orders": baseline_avg,
+        "threshold": threshold,
+        "is_anomaly": order_count >= threshold,
     }
