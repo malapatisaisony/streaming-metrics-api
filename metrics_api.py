@@ -1,7 +1,7 @@
 import logging
 import os
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from time import monotonic
 from typing import Annotated
@@ -37,6 +37,14 @@ NEXT_PAGE_SQL = (
     + METRICS_ORDER_SQL
 )
 
+ROLLING_COUNT_SQL = """
+SELECT COALESCE(SUM(order_count), 0) AS order_count
+FROM public.order_metrics
+WHERE currency = %s
+  AND window_start >= %s
+  AND window_start < %s
+"""
+
 
 class MinuteMetric(BaseModel):
     window_start: datetime
@@ -49,6 +57,13 @@ class MinuteMetric(BaseModel):
 class MinuteMetricsPage(BaseModel):
     items: list[MinuteMetric]
     next_page: str | None
+
+
+class RollingOrderCount(BaseModel):
+    window_start: datetime
+    window_end: datetime
+    currency: str
+    order_count: int
 
 
 CACHE_TTL_SECONDS = 5
@@ -82,6 +97,36 @@ def store_cached_page(key: CacheKey, page: MinuteMetricsPage) -> None:
             page_cache.popitem(last=False)
 
 
+def fetch_metric_rows(query: str, params: tuple):
+    try:
+        with psycopg.connect(
+            host=os.getenv("PGHOST", "127.0.0.1"),
+            port=os.getenv("PGPORT", "5433"),
+            dbname=os.getenv("PGDATABASE", "streaming_metrics"),
+            user=os.getenv("PGUSER", "metrics"),
+            password=POSTGRES_PASSWORD,
+            connect_timeout=5,
+            options="-c timezone=UTC -c statement_timeout=5000",
+            autocommit=True,
+            row_factory=dict_row,
+        ) as connection:
+            return connection.execute(query, params).fetchall()
+    except psycopg.OperationalError as exc:
+        logger.exception("Could not read metrics from PostgreSQL")
+        raise HTTPException(
+            status_code=503,
+            detail="Metrics database unavailable",
+        ) from exc
+
+
+def five_minute_bounds(reference_time: datetime) -> tuple[datetime, datetime]:
+    minute_start = reference_time.astimezone(timezone.utc).replace(
+        second=0, microsecond=0
+    )
+    window_end = minute_start + timedelta(minutes=1)
+    return window_end - timedelta(minutes=5), window_end
+
+
 @app.get("/metrics/minute", response_model=MinuteMetricsPage)
 def get_minute_metrics(
     response: Response,
@@ -110,26 +155,7 @@ def get_minute_metrics(
         query = NEXT_PAGE_SQL
         params = (before_start, before_currency, limit + 1)
 
-    try:
-        with psycopg.connect(
-            host=os.getenv("PGHOST", "127.0.0.1"),
-            port=os.getenv("PGPORT", "5433"),
-            dbname=os.getenv("PGDATABASE", "streaming_metrics"),
-            user=os.getenv("PGUSER", "metrics"),
-            password=POSTGRES_PASSWORD,
-            connect_timeout=5,
-            options="-c timezone=UTC -c statement_timeout=5000",
-            autocommit=True,
-            row_factory=dict_row,
-        ) as connection:
-            rows = connection.execute(query, params).fetchall()
-    except psycopg.OperationalError as exc:
-        logger.exception("Could not read minute metrics from PostgreSQL")
-        raise HTTPException(
-            status_code=503,
-            detail="Metrics database unavailable",
-        ) from exc
-
+    rows = fetch_metric_rows(query, params)
     items = rows[:limit]
     next_page = None
 
@@ -149,3 +175,30 @@ def get_minute_metrics(
     store_cached_page(key, page)
     response.headers["X-Cache"] = "MISS"
     return page
+
+
+@app.get("/metrics/rolling", response_model=RollingOrderCount)
+def get_rolling_order_count(
+    currency: Annotated[str, Query(pattern=r"^[A-Z]{3}$")] = "USD",
+    at_minute: Annotated[
+        AwareDatetime | None,
+        Query(description="Last minute to include. Defaults to the current UTC minute."),
+    ] = None,
+):
+    try:
+        window_start, window_end = five_minute_bounds(
+            at_minute or datetime.now(timezone.utc)
+        )
+    except OverflowError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="at_minute is outside the supported time range.",
+        ) from exc
+
+    rows = fetch_metric_rows(ROLLING_COUNT_SQL, (currency, window_start, window_end))
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+        "currency": currency,
+        "order_count": int(rows[0]["order_count"]),
+    }
