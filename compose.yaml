@@ -40,8 +40,8 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - type: bind
-        source: ./sql/001_create_metrics.sql
-        target: /docker-entrypoint-initdb.d/001_create_metrics.sql
+        source: ./sql
+        target: /docker-entrypoint-initdb.d
         read_only: true
         bind:
           create_host_path: false

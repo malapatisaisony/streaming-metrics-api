@@ -7,7 +7,9 @@ from pyspark.sql.functions import (
     col,
     count,
     from_json,
+    length,
     sum as spark_sum,
+    trim,
     try_to_timestamp,
     window,
 )
@@ -44,6 +46,18 @@ DO UPDATE SET
     order_count = EXCLUDED.order_count,
     revenue_cents = EXCLUDED.revenue_cents,
     updated_at = CURRENT_TIMESTAMP
+"""
+
+UPSERT_CUSTOMER_METRICS_SQL = """
+INSERT INTO public.customer_order_metrics (
+    window_start,
+    currency,
+    customer_id,
+    order_count
+)
+VALUES (%s, %s, %s, %s)
+ON CONFLICT (currency, window_start, customer_id)
+DO UPDATE SET order_count = EXCLUDED.order_count
 """
 
 
@@ -99,26 +113,27 @@ def calculate_metrics(orders):
     )
 
 
-def write_metrics_to_postgres(batch_df, batch_id):
-    # Each batch contains one row per updated minute and currency.
-    rows = batch_df.collect()
-
-    if not rows:
-        print(f"Batch {batch_id}: no metric updates.", flush=True)
-        return
-
-    # Spark's container runs in UTC. Attach that timezone to the Python values.
-    records = [
-        (
-            row.window_start.replace(tzinfo=timezone.utc),
-            row.window_end.replace(tzinfo=timezone.utc),
-            row.currency,
-            row.order_count,
-            row.revenue_cents,
+def calculate_customer_metrics(orders):
+    return (
+        orders
+        .filter(length(trim(col("customer_id"))) > 0)
+        .withWatermark("event_time", "2 minutes")
+        .groupBy(
+            window(col("event_time"), "1 minute"),
+            col("currency"),
+            col("customer_id"),
         )
-        for row in rows
-    ]
+        .agg(count("*").alias("order_count"))
+        .select(
+            col("window.start").alias("window_start"),
+            col("currency"),
+            col("customer_id"),
+            col("order_count"),
+        )
+    )
 
+
+def upsert_in_postgres(sql, records):
     with psycopg.connect(
         host=os.environ["PGHOST"],
         port=int(os.environ["PGPORT"]),
@@ -129,11 +144,67 @@ def write_metrics_to_postgres(batch_df, batch_id):
         options="-c timezone=UTC -c statement_timeout=30000 -c lock_timeout=10000",
     ) as connection:
         with connection.cursor() as cursor:
-            cursor.executemany(UPSERT_METRICS_SQL, records)
+            cursor.executemany(sql, records)
 
+
+def write_metrics_to_postgres(batch_df, batch_id):
+    # The Spark container runs in UTC.
+    records = [
+        (
+            row.window_start.replace(tzinfo=timezone.utc),
+            row.window_end.replace(tzinfo=timezone.utc),
+            row.currency,
+            row.order_count,
+            row.revenue_cents,
+        )
+        for row in batch_df.collect()
+    ]
+
+    if not records:
+        print(f"Batch {batch_id}: no metric updates.", flush=True)
+        return
+
+    upsert_in_postgres(UPSERT_METRICS_SQL, records)
     print(
         f"Batch {batch_id}: saved {len(records)} metric window(s) to PostgreSQL.",
         flush=True,
+    )
+
+
+def write_customer_metrics_to_postgres(batch_df, batch_id):
+    records = [
+        (
+            row.window_start.replace(tzinfo=timezone.utc),
+            row.currency,
+            row.customer_id,
+            row.order_count,
+        )
+        for row in batch_df.collect()
+    ]
+
+    if not records:
+        return
+
+    upsert_in_postgres(UPSERT_CUSTOMER_METRICS_SQL, records)
+    print(
+        f"Customer batch {batch_id}: saved {len(records)} "
+        "customer window(s) to PostgreSQL.",
+        flush=True,
+    )
+
+
+def start_postgres_query(metrics, query_name, checkpoint_name, writer):
+    return (
+        metrics.writeStream
+        .queryName(query_name)
+        .outputMode("update")
+        .foreachBatch(writer)
+        .option(
+            "checkpointLocation",
+            f"/opt/spark/work-dir/checkpoints/{checkpoint_name}",
+        )
+        .trigger(processingTime="10 seconds")
+        .start()
     )
 
 
@@ -151,22 +222,22 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
 
     try:
-        metrics = calculate_metrics(read_orders(spark))
+        orders = read_orders(spark)
 
-        query = (
-            metrics.writeStream
-            .queryName("orders_metrics_postgres")
-            .outputMode("update")
-            .foreachBatch(write_metrics_to_postgres)
-            .option(
-                "checkpointLocation",
-                "/opt/spark/work-dir/checkpoints/orders-postgres-v1",
-            )
-            .trigger(processingTime="10 seconds")
-            .start()
+        start_postgres_query(
+            calculate_metrics(orders),
+            query_name="orders_metrics_postgres",
+            checkpoint_name="orders-postgres-v1",
+            writer=write_metrics_to_postgres,
+        )
+        start_postgres_query(
+            calculate_customer_metrics(orders),
+            query_name="customer_order_metrics_postgres",
+            checkpoint_name="customer-orders-postgres-v1",
+            writer=write_customer_metrics_to_postgres,
         )
 
-        query.awaitTermination()
+        spark.streams.awaitAnyTermination()
     finally:
         spark.stop()
 
