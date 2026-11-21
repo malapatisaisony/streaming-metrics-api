@@ -45,6 +45,17 @@ WHERE currency = %s
   AND window_start < %s
 """
 
+TOP_CUSTOMERS_SQL = """
+SELECT customer_id, SUM(order_count) AS order_count
+FROM public.customer_order_metrics
+WHERE currency = %s
+  AND window_start >= %s
+  AND window_start < %s
+GROUP BY customer_id
+ORDER BY SUM(order_count) DESC, customer_id ASC
+LIMIT %s
+"""
+
 
 class MinuteMetric(BaseModel):
     window_start: datetime
@@ -64,6 +75,18 @@ class RollingOrderCount(BaseModel):
     window_end: datetime
     currency: str
     order_count: int
+
+
+class CustomerOrderCount(BaseModel):
+    customer_id: str
+    order_count: int
+
+
+class TopCustomers(BaseModel):
+    window_start: datetime
+    window_end: datetime
+    currency: str
+    items: list[CustomerOrderCount]
 
 
 CACHE_TTL_SECONDS = 5
@@ -119,12 +142,20 @@ def fetch_metric_rows(query: str, params: tuple):
         ) from exc
 
 
-def five_minute_bounds(reference_time: datetime) -> tuple[datetime, datetime]:
-    minute_start = reference_time.astimezone(timezone.utc).replace(
-        second=0, microsecond=0
-    )
-    window_end = minute_start + timedelta(minutes=1)
-    return window_end - timedelta(minutes=5), window_end
+def five_minute_bounds(at_minute: datetime | None) -> tuple[datetime, datetime]:
+    reference_time = at_minute or datetime.now(timezone.utc)
+
+    try:
+        minute_start = reference_time.astimezone(timezone.utc).replace(
+            second=0, microsecond=0
+        )
+        window_end = minute_start + timedelta(minutes=1)
+        return window_end - timedelta(minutes=5), window_end
+    except OverflowError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="at_minute is outside the supported time range.",
+        ) from exc
 
 
 @app.get("/metrics/minute", response_model=MinuteMetricsPage)
@@ -185,15 +216,7 @@ def get_rolling_order_count(
         Query(description="Last minute to include. Defaults to the current UTC minute."),
     ] = None,
 ):
-    try:
-        window_start, window_end = five_minute_bounds(
-            at_minute or datetime.now(timezone.utc)
-        )
-    except OverflowError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail="at_minute is outside the supported time range.",
-        ) from exc
+    window_start, window_end = five_minute_bounds(at_minute)
 
     rows = fetch_metric_rows(ROLLING_COUNT_SQL, (currency, window_start, window_end))
     return {
@@ -201,4 +224,27 @@ def get_rolling_order_count(
         "window_end": window_end,
         "currency": currency,
         "order_count": int(rows[0]["order_count"]),
+    }
+
+
+@app.get("/metrics/top-customers", response_model=TopCustomers)
+def get_top_customers(
+    currency: Annotated[str, Query(pattern=r"^[A-Z]{3}$")] = "USD",
+    at_minute: Annotated[
+        AwareDatetime | None,
+        Query(description="Last minute to include. Defaults to the current UTC minute."),
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 5,
+):
+    window_start, window_end = five_minute_bounds(at_minute)
+    rows = fetch_metric_rows(
+        TOP_CUSTOMERS_SQL,
+        (currency, window_start, window_end, limit),
+    )
+
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+        "currency": currency,
+        "items": rows,
     }
