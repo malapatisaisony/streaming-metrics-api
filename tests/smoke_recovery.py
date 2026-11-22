@@ -69,7 +69,7 @@ def wait_for_totals(expected, timeout=180):
         minute_orders, customer_orders = postgres_totals()
         try:
             api_orders = api_total()
-        except (TimeoutError, URLError):
+        except (ConnectionError,TimeoutError, URLError):
             api_orders = None
 
         last = minute_orders, customer_orders, api_orders
