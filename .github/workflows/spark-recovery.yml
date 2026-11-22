@@ -1,0 +1,28 @@
+name: Spark recovery test
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  spark-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Check Docker Compose
+        run: docker compose version
+
+      - name: Install producer dependency
+        run: python -m pip install -r requirements.txt
+
+      - name: Run the Spark recovery test
+        run: python tests/smoke_recovery.py
