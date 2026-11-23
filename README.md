@@ -85,7 +85,7 @@ Use `at_minute` with a UTC timestamp from `window_start` to query an earlier win
 
 ## Verification and performance
 
-- **Pipeline smoke tests:** The [manual GitHub Actions workflow](https://github.com/malapatisaisony/streaming-metrics-api/actions/workflows/spark-recovery.yml) runs restart recovery, event-time and currency grouping, malformed order handling, and duplicate order protection in separate jobs.
+- **Pipeline smoke tests:** The [manual GitHub Actions workflow](https://github.com/malapatisaisony/streaming-metrics-api/actions/workflows/spark-recovery.yml) runs restart recovery, event-time and currency grouping, malformed order handling, and duplicate order protection in separate jobs. [All four passed on the duplicate-order commit](https://github.com/malapatisaisony/streaming-metrics-api/actions/runs/45270912179).
 - **API rules:** [GitHub Actions](https://github.com/malapatisaisony/streaming-metrics-api/actions/workflows/api-tests.yml) checks rolling window boundaries and anomaly thresholds.
 - **Spark recovery:** The [recovery test](tests/smoke_recovery.py) processes five orders, stops Spark, and sends three more. After restart, both PostgreSQL aggregate tables and the API report eight orders.
 - **Event time:** The [event time test](tests/smoke_event_time.py) verifies separate USD and EUR totals and accepts an order that arrived within the watermark allowance. A much older order left the earlier window unchanged in this test.
@@ -95,14 +95,25 @@ Use `at_minute` with a UTC timestamp from `window_start` to query an earlier win
 
 ### Order to API freshness
 
-These baseline measurements are from commit `73fe72a`, before duplicate order protection was added. On Windows with Docker Desktop, each trial sent 30 synthetic orders at one order per second. The benchmark timed each order from the producer send to the first `/metrics/minute` response showing it. The results exclude startup and warm-up and include Spark batch scheduling, the API's five-second cache, and client polling at roughly half-second intervals.
+On Windows with Docker Desktop, the pipeline with duplicate order protection ran three trials of 30 synthetic orders at one order per second. Freshness measures the time from the producer send to the first `/metrics/minute` response showing that order. Startup and the warm-up order are excluded.
 
 | Trial | Orders | Send rate | p50 | p95 | Max |
 |---|---:|---:|---:|---:|---:|
-| 1 | 30 | 1.00 order/s | 14.90 s | 25.44 s | 26.44 s |
-| 2 | 30 | 1.00 order/s | 12.20 s | 17.42 s | 18.42 s |
+| 1 | 30 | 1.00 order/s | 8.33 s | 13.23 s | 13.66 s |
+| 2 | 30 | 1.00 order/s | 10.33 s | 15.22 s | 15.69 s |
+| 3 | 30 | 1.00 order/s | 9.76 s | 15.94 s | 16.94 s |
 
-Both PostgreSQL aggregate tables and the API counted 61 orders, including the warm-up order. These results describe two local runs at the stated send rate.
+Spark reported these durations for the nonempty order batches. `triggerExecution` is the active trigger duration; `addBatch` is the part of that trigger that processes the batch and writes the results to PostgreSQL.
+
+| Trial | Batches | Trigger p50 | Trigger max | addBatch p50 | addBatch max |
+|---|---:|---:|---:|---:|---:|
+| 1 | 4 | 2560.5 ms | 2712.0 ms | 2241.5 ms | 2374.0 ms |
+| 2 | 4 | 2086.0 ms | 2131.0 ms | 1942.0 ms | 1969.0 ms |
+| 3 | 4 | 2007.5 ms | 2071.0 ms | 1874.0 ms | 1899.0 ms |
+
+Both PostgreSQL aggregate tables and the API counted 91 orders, including one warm-up order. The longest active trigger took 2.712 seconds. Order-to-API freshness also includes waiting for Spark's next 10-second trigger, the API's five-second cache, and client polling at roughly half-second intervals. The benchmark does not measure those contributions separately.
+
+For comparison, the [earlier baseline](https://github.com/malapatisaisony/streaming-metrics-api/blob/73fe72ac9d26e7274f0bfc5657e10af6cce6aed2/README.md#order-to-api-freshness) measured p95 of 25.44 s and 17.42 s in two 30-order trials at the same send rate. The newer trials observed lower p95 values on this local setup, without isolating which changes caused the difference.
 
 To reproduce from the repository root after installing the producer dependency:
 

@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import timezone
 
@@ -13,6 +14,7 @@ from pyspark.sql.functions import (
     when,
     window,
 )
+from pyspark.sql.streaming import StreamingQueryListener
 from pyspark.sql.types import (
     IntegerType,
     LongType,
@@ -21,6 +23,9 @@ from pyspark.sql.types import (
     StructType,
 )
 
+
+ORDERS_QUERY_NAME = "accepted_order_metrics_postgres"
+SPARK_BATCH_LOG_PREFIX = "ORDER_BATCH_TIMING "
 
 ORDER_SCHEMA = StructType([
     StructField("schema_version", IntegerType()),
@@ -262,6 +267,32 @@ def start_postgres_query(rows, query_name, checkpoint_name, writer):
     )
 
 
+class OrderBatchTimingListener(StreamingQueryListener):
+    """Log Spark's completed, nonempty order batches for benchmarking."""
+
+    def onQueryStarted(self, event):
+        pass
+
+    def onQueryIdle(self, event):
+        pass
+
+    def onQueryTerminated(self, event):
+        pass
+
+    def onQueryProgress(self, event):
+        progress = event.progress
+        if progress.name != ORDERS_QUERY_NAME or progress.numInputRows == 0:
+            return
+        durations = progress.durationMs
+        record = {
+            "batch_id": progress.batchId,
+            "input_rows": progress.numInputRows,
+            "trigger_ms": durations.get("triggerExecution"),
+            "add_batch_ms": durations.get("addBatch"),
+        }
+        print(SPARK_BATCH_LOG_PREFIX + json.dumps(record), flush=True)
+
+
 def main():
     check_order_store()
     spark = (
@@ -277,6 +308,7 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
 
     try:
+        spark.streams.addListener(OrderBatchTimingListener())
         orders = read_orders(spark)
         valid_orders = orders.filter(col("rejection_reason").isNull())
         rejected_orders = orders.filter(col("rejection_reason").isNotNull()).select(
@@ -285,7 +317,7 @@ def main():
 
         start_postgres_query(
             orders_for_postgres(valid_orders),
-            query_name="accepted_order_metrics_postgres",
+            query_name=ORDERS_QUERY_NAME,
             checkpoint_name="accepted-orders-postgres-v2",
             writer=write_orders_to_postgres,
         )
