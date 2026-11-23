@@ -79,6 +79,8 @@ Use `at_minute` with a UTC timestamp from `window_start` to query an earlier win
 
 ## Verification and performance
 
+- **Pipeline smoke tests:** The [manual GitHub Actions run](https://github.com/malapatisaisony/streaming-metrics-api/actions/runs/45111871934) passed Spark restart recovery, event-time and currency grouping, and malformed order handling.
+
 - **API rules:** [GitHub Actions](https://github.com/malapatisaisony/streaming-metrics-api/actions/workflows/api-tests.yml) checks rolling window boundaries and anomaly thresholds.
 - **Spark recovery:** The [recovery test](tests/smoke_recovery.py) processes five orders, stops Spark, and sends three more. After restart, both PostgreSQL aggregate tables and the API report eight orders.
 - **Event time:** The [event time test](tests/smoke_event_time.py) verifies separate USD and EUR totals and accepts an order that arrived within the watermark allowance. A much older order left the earlier window unchanged in this test.
