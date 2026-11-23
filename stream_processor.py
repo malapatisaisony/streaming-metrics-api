@@ -11,6 +11,7 @@ from pyspark.sql.functions import (
     sum as spark_sum,
     trim,
     try_to_timestamp,
+    when,
     window,
 )
 from pyspark.sql.types import (
@@ -29,6 +30,7 @@ ORDER_SCHEMA = StructType([
     StructField("event_time", StringType()),
     StructField("amount_cents", LongType()),
     StructField("currency", StringType()),
+    StructField("_corrupt_record", StringType()),
 ])
 
 UPSERT_METRICS_SQL = """
@@ -60,6 +62,17 @@ ON CONFLICT (currency, window_start, customer_id)
 DO UPDATE SET order_count = EXCLUDED.order_count
 """
 
+INSERT_REJECTED_ORDER_SQL = """
+INSERT INTO public.rejected_order_events (
+    kafka_topic,
+    kafka_partition,
+    kafka_offset,
+    rejection_reason
+)
+VALUES (%s, %s, %s, %s)
+ON CONFLICT (kafka_topic, kafka_partition, kafka_offset) DO NOTHING
+"""
+
 
 def read_orders(spark):
     messages = (
@@ -77,17 +90,49 @@ def read_orders(spark):
             from_json(
                 col("value").cast("string"),
                 ORDER_SCHEMA,
-                {"mode": "FAILFAST"},
+                {"mode": "PERMISSIVE", "columnNameOfCorruptRecord": "_corrupt_record"},
             ).alias("order"),
+            col("topic").alias("kafka_topic"),
             col("partition").alias("kafka_partition"),
             col("offset").alias("kafka_offset"),
         )
-        .select("order.*", "kafka_partition", "kafka_offset")
+        .select(
+            "order.*",
+            "kafka_topic",
+            "kafka_partition",
+            "kafka_offset",
+            col("order").isNull().alias("missing_payload"),
+        )
+        .withColumn("event_time", try_to_timestamp(col("event_time")))
     )
 
     return orders.withColumn(
-        "event_time",
-        try_to_timestamp(col("event_time")),
+        "rejection_reason",
+        when(
+            col("missing_payload") | col("_corrupt_record").isNotNull(),
+            "invalid_payload",
+        )
+        .when(
+            col("schema_version").isNull() | (col("schema_version") != 1),
+            "invalid_schema_version",
+        )
+        .when(
+            col("order_id").isNull() | (length(trim(col("order_id"))) == 0),
+            "missing_order_id",
+        )
+        .when(
+            col("customer_id").isNull() | (length(trim(col("customer_id"))) == 0),
+            "missing_customer_id",
+        )
+        .when(col("event_time").isNull(), "invalid_event_time")
+        .when(
+            col("amount_cents").isNull() | (col("amount_cents") < 0),
+            "invalid_amount",
+        )
+        .when(
+            col("currency").isNull() | ~col("currency").rlike(r"\A[A-Z]{3}\z"),
+            "invalid_currency",
+        ),
     )
 
 
@@ -193,11 +238,27 @@ def write_customer_metrics_to_postgres(batch_df, batch_id):
     )
 
 
-def start_postgres_query(metrics, query_name, checkpoint_name, writer):
+def write_rejected_orders_to_postgres(batch_df, batch_id):
+    records = [
+        (
+            row.kafka_topic,
+            row.kafka_partition,
+            row.kafka_offset,
+            row.rejection_reason,
+        )
+        for row in batch_df.collect()
+    ]
+
+    if records:
+        upsert_in_postgres(INSERT_REJECTED_ORDER_SQL, records)
+        print(f"Rejected batch {batch_id}: saved {len(records)} rejection(s).", flush=True)
+
+
+def start_postgres_query(rows, query_name, checkpoint_name, writer, output_mode="update"):
     return (
-        metrics.writeStream
+        rows.writeStream
         .queryName(query_name)
-        .outputMode("update")
+        .outputMode(output_mode)
         .foreachBatch(writer)
         .option(
             "checkpointLocation",
@@ -223,18 +284,29 @@ def main():
 
     try:
         orders = read_orders(spark)
+        valid_orders = orders.filter(col("rejection_reason").isNull())
+        rejected_orders = orders.filter(col("rejection_reason").isNotNull()).select(
+            "kafka_topic", "kafka_partition", "kafka_offset", "rejection_reason"
+        )
 
         start_postgres_query(
-            calculate_metrics(orders),
+            calculate_metrics(valid_orders),
             query_name="orders_metrics_postgres",
             checkpoint_name="orders-postgres-v1",
             writer=write_metrics_to_postgres,
         )
         start_postgres_query(
-            calculate_customer_metrics(orders),
+            calculate_customer_metrics(valid_orders),
             query_name="customer_order_metrics_postgres",
             checkpoint_name="customer-orders-postgres-v1",
             writer=write_customer_metrics_to_postgres,
+        )
+        start_postgres_query(
+            rejected_orders,
+            query_name="rejected_order_events_postgres",
+            checkpoint_name="rejected-orders-postgres-v1",
+            writer=write_rejected_orders_to_postgres,
+            output_mode="append",
         )
 
         spark.streams.awaitAnyTermination()
