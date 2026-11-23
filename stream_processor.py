@@ -2,13 +2,12 @@ import os
 from datetime import timezone
 
 import psycopg
+from psycopg.types.json import Jsonb
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
-    count,
     from_json,
     length,
-    sum as spark_sum,
     trim,
     try_to_timestamp,
     when,
@@ -33,33 +32,50 @@ ORDER_SCHEMA = StructType([
     StructField("_corrupt_record", StringType()),
 ])
 
-UPSERT_METRICS_SQL = """
-INSERT INTO public.order_metrics (
-    window_start,
-    window_end,
-    currency,
-    order_count,
-    revenue_cents
+# Only rows inserted into the ledger can contribute to either aggregate.
+APPLY_ORDER_BATCH_SQL = """
+WITH new_orders AS (
+    INSERT INTO public.processed_orders (
+        order_id, window_start, currency, customer_id, amount_cents
+    )
+    SELECT order_id, window_start, currency, customer_id, amount_cents
+    FROM jsonb_to_recordset(%s) AS incoming (
+        order_id TEXT, window_start TIMESTAMPTZ, currency TEXT,
+        customer_id TEXT, amount_cents BIGINT
+    )
+    ON CONFLICT (order_id) DO NOTHING
+    RETURNING window_start, currency, customer_id, amount_cents
+),
+minute_updates AS (
+    INSERT INTO public.order_metrics AS totals (
+        window_start, window_end, currency, order_count, revenue_cents
+    )
+    SELECT
+        window_start, window_start + INTERVAL '1 minute',
+        currency, COUNT(*), SUM(amount_cents)::BIGINT
+    FROM new_orders
+    GROUP BY window_start, currency
+    ON CONFLICT (window_start, currency) DO UPDATE SET
+        order_count = totals.order_count + EXCLUDED.order_count,
+        revenue_cents = totals.revenue_cents + EXCLUDED.revenue_cents,
+        updated_at = CURRENT_TIMESTAMP
+    RETURNING 1
+),
+customer_updates AS (
+    INSERT INTO public.customer_order_metrics AS totals (
+        window_start, currency, customer_id, order_count
+    )
+    SELECT window_start, currency, customer_id, COUNT(*)
+    FROM new_orders
+    GROUP BY window_start, currency, customer_id
+    ON CONFLICT (currency, window_start, customer_id) DO UPDATE SET
+        order_count = totals.order_count + EXCLUDED.order_count
+    RETURNING 1
 )
-VALUES (%s, %s, %s, %s, %s)
-ON CONFLICT (window_start, currency)
-DO UPDATE SET
-    window_end = EXCLUDED.window_end,
-    order_count = EXCLUDED.order_count,
-    revenue_cents = EXCLUDED.revenue_cents,
-    updated_at = CURRENT_TIMESTAMP
-"""
-
-UPSERT_CUSTOMER_METRICS_SQL = """
-INSERT INTO public.customer_order_metrics (
-    window_start,
-    currency,
-    customer_id,
-    order_count
-)
-VALUES (%s, %s, %s, %s)
-ON CONFLICT (currency, window_start, customer_id)
-DO UPDATE SET order_count = EXCLUDED.order_count
+SELECT
+    (SELECT COUNT(*) FROM new_orders),
+    (SELECT COUNT(*) FROM minute_updates),
+    (SELECT COUNT(*) FROM customer_updates)
 """
 
 INSERT_REJECTED_ORDER_SQL = """
@@ -136,50 +152,23 @@ def read_orders(spark):
     )
 
 
-def calculate_metrics(orders):
+def orders_for_postgres(valid_orders):
     return (
-        orders
+        valid_orders
         .withWatermark("event_time", "2 minutes")
-        .groupBy(
-            window(col("event_time"), "1 minute"),
-            col("currency"),
-        )
-        .agg(
-            count("*").alias("order_count"),
-            spark_sum("amount_cents").alias("revenue_cents"),
-        )
+        # Apply the event-time watermark to Kafka records. A producer retry
+        # has a new offset; PostgreSQL handles duplicate business order IDs.
+        .dropDuplicatesWithinWatermark(["kafka_topic", "kafka_partition", "kafka_offset"])
+        .withColumn("event_window", window(col("event_time"), "1 minute"))
         .select(
-            col("window.start").alias("window_start"),
-            col("window.end").alias("window_end"),
-            col("currency"),
-            col("order_count"),
-            col("revenue_cents"),
+            "order_id", col("event_window.start").alias("window_start"),
+            "currency", "customer_id", "amount_cents",
         )
     )
 
 
-def calculate_customer_metrics(orders):
-    return (
-        orders
-        .filter(length(trim(col("customer_id"))) > 0)
-        .withWatermark("event_time", "2 minutes")
-        .groupBy(
-            window(col("event_time"), "1 minute"),
-            col("currency"),
-            col("customer_id"),
-        )
-        .agg(count("*").alias("order_count"))
-        .select(
-            col("window.start").alias("window_start"),
-            col("currency"),
-            col("customer_id"),
-            col("order_count"),
-        )
-    )
-
-
-def upsert_in_postgres(sql, records):
-    with psycopg.connect(
+def postgres_connection():
+    return psycopg.connect(
         host=os.environ["PGHOST"],
         port=int(os.environ["PGPORT"]),
         dbname=os.environ["PGDATABASE"],
@@ -187,53 +176,55 @@ def upsert_in_postgres(sql, records):
         password=os.environ["PGPASSWORD"],
         connect_timeout=10,
         options="-c timezone=UTC -c statement_timeout=30000 -c lock_timeout=10000",
-    ) as connection:
-        with connection.cursor() as cursor:
-            cursor.executemany(sql, records)
-
-
-def write_metrics_to_postgres(batch_df, batch_id):
-    # The Spark container runs in UTC.
-    records = [
-        (
-            row.window_start.replace(tzinfo=timezone.utc),
-            row.window_end.replace(tzinfo=timezone.utc),
-            row.currency,
-            row.order_count,
-            row.revenue_cents,
-        )
-        for row in batch_df.collect()
-    ]
-
-    if not records:
-        print(f"Batch {batch_id}: no metric updates.", flush=True)
-        return
-
-    upsert_in_postgres(UPSERT_METRICS_SQL, records)
-    print(
-        f"Batch {batch_id}: saved {len(records)} metric window(s) to PostgreSQL.",
-        flush=True,
     )
 
 
-def write_customer_metrics_to_postgres(batch_df, batch_id):
-    records = [
-        (
-            row.window_start.replace(tzinfo=timezone.utc),
-            row.currency,
-            row.customer_id,
-            row.order_count,
+def check_order_store():
+    with postgres_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('public.processed_orders')")
+            if cursor.fetchone()[0] is None:
+                raise RuntimeError(
+                    "The unique order table is missing. Start a fresh Compose project "
+                    "with new volumes for the duplicate-safe pipeline."
+                )
+            cursor.execute("""
+                SELECT
+                    EXISTS (SELECT 1 FROM public.processed_orders),
+                    EXISTS (SELECT 1 FROM public.order_metrics)
+                        OR EXISTS (SELECT 1 FROM public.customer_order_metrics)
+            """)
+            has_orders, has_metrics = cursor.fetchone()
+    if has_metrics and not has_orders:
+        raise RuntimeError(
+            "Existing metrics predate the order ledger. Start a fresh Compose project "
+            "so replaying orders cannot add to those old totals."
         )
+
+
+def write_orders_to_postgres(batch_df, batch_id):
+    records = [
+        {
+            "order_id": row.order_id,
+            "window_start": row.window_start.replace(tzinfo=timezone.utc).isoformat(),
+            "currency": row.currency,
+            "customer_id": row.customer_id,
+            "amount_cents": row.amount_cents,
+        }
         for row in batch_df.collect()
     ]
-
     if not records:
         return
 
-    upsert_in_postgres(UPSERT_CUSTOMER_METRICS_SQL, records)
+    with postgres_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(APPLY_ORDER_BATCH_SQL, (Jsonb(records),))
+            accepted_orders, minute_windows, customer_windows = cursor.fetchone()
+
     print(
-        f"Customer batch {batch_id}: saved {len(records)} "
-        "customer window(s) to PostgreSQL.",
+        f"Orders batch {batch_id}: accepted {accepted_orders} of {len(records)} "
+        f"record(s); updated {minute_windows} minute and {customer_windows} "
+        "customer window(s).",
         flush=True,
     )
 
@@ -250,15 +241,17 @@ def write_rejected_orders_to_postgres(batch_df, batch_id):
     ]
 
     if records:
-        upsert_in_postgres(INSERT_REJECTED_ORDER_SQL, records)
+        with postgres_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.executemany(INSERT_REJECTED_ORDER_SQL, records)
         print(f"Rejected batch {batch_id}: saved {len(records)} rejection(s).", flush=True)
 
 
-def start_postgres_query(rows, query_name, checkpoint_name, writer, output_mode="update"):
+def start_postgres_query(rows, query_name, checkpoint_name, writer):
     return (
         rows.writeStream
         .queryName(query_name)
-        .outputMode(output_mode)
+        .outputMode("append")
         .foreachBatch(writer)
         .option(
             "checkpointLocation",
@@ -270,6 +263,7 @@ def start_postgres_query(rows, query_name, checkpoint_name, writer, output_mode=
 
 
 def main():
+    check_order_store()
     spark = (
         SparkSession.builder
         .appName("OrdersStreamProcessor")
@@ -290,23 +284,16 @@ def main():
         )
 
         start_postgres_query(
-            calculate_metrics(valid_orders),
-            query_name="orders_metrics_postgres",
-            checkpoint_name="orders-postgres-v1",
-            writer=write_metrics_to_postgres,
-        )
-        start_postgres_query(
-            calculate_customer_metrics(valid_orders),
-            query_name="customer_order_metrics_postgres",
-            checkpoint_name="customer-orders-postgres-v1",
-            writer=write_customer_metrics_to_postgres,
+            orders_for_postgres(valid_orders),
+            query_name="accepted_order_metrics_postgres",
+            checkpoint_name="accepted-orders-postgres-v2",
+            writer=write_orders_to_postgres,
         )
         start_postgres_query(
             rejected_orders,
             query_name="rejected_order_events_postgres",
             checkpoint_name="rejected-orders-postgres-v1",
             writer=write_rejected_orders_to_postgres,
-            output_mode="append",
         )
 
         spark.streams.awaitAnyTermination()

@@ -20,6 +20,8 @@ jobs:
             script: tests/smoke_event_time.py
           - name: Malformed orders
             script: tests/smoke_malformed_orders.py
+          - name: Duplicate orders after Spark restart
+            script: tests/smoke_duplicate_orders.py
     steps:
       - uses: actions/checkout@v6
         with:
