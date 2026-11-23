@@ -22,6 +22,8 @@ PostgreSQL stores each accepted `order_id` once in `processed_orders`. Only newl
 
 Invalid orders are excluded from the aggregates. A separate query records the rejection reason and the Kafka topic, partition, and offset in PostgreSQL.
 
+Valid orders whose event time is older than Spark's current watermark are dropped before aggregation and do not create a row in `rejected_order_events`.
+
 FastAPI reads the stored aggregates and calculates rolling order counts, customer rankings, and order volume anomaly flags at request time.
 
 ## Run locally on Windows
@@ -85,7 +87,7 @@ Use `at_minute` with a UTC timestamp from `window_start` to query an earlier win
 
 ## Verification and performance
 
-- **Pipeline smoke tests:** The [manual GitHub Actions workflow](https://github.com/malapatisaisony/streaming-metrics-api/actions/workflows/spark-recovery.yml) runs restart recovery, event-time and currency grouping, malformed order handling, and duplicate order protection in separate jobs. [All four passed on the duplicate-order commit](https://github.com/malapatisaisony/streaming-metrics-api/actions/runs/45270912179).
+- **Pipeline smoke tests:** The [manual GitHub Actions workflow](https://github.com/malapatisaisony/streaming-metrics-api/actions/workflows/spark-recovery.yml) runs restart recovery, event-time and currency grouping, malformed order handling, and duplicate order protection in separate jobs. [All four passed on commit `4414b25`](https://github.com/malapatisaisony/streaming-metrics-api/actions/runs/45276447096).
 - **API rules:** [GitHub Actions](https://github.com/malapatisaisony/streaming-metrics-api/actions/workflows/api-tests.yml) checks rolling window boundaries and anomaly thresholds.
 - **Spark recovery:** The [recovery test](tests/smoke_recovery.py) processes five orders, stops Spark, and sends three more. After restart, both PostgreSQL aggregate tables and the API report eight orders.
 - **Event time:** The [event time test](tests/smoke_event_time.py) verifies separate USD and EUR totals and accepts an order that arrived within the watermark allowance. A much older order left the earlier window unchanged in this test.
