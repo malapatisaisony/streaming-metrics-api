@@ -1,4 +1,4 @@
-name: Spark recovery test
+name: Pipeline smoke tests
 
 on: workflow_dispatch
 
@@ -6,9 +6,20 @@ permissions:
   contents: read
 
 jobs:
-  spark-recovery:
+  pipeline-smoke:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Spark restart recovery
+            script: tests/smoke_recovery.py
+          - name: Event time and currency grouping
+            script: tests/smoke_event_time.py
+          - name: Malformed orders
+            script: tests/smoke_malformed_orders.py
     steps:
       - uses: actions/checkout@v6
         with:
@@ -24,5 +35,7 @@ jobs:
       - name: Install producer dependency
         run: python -m pip install -r requirements.txt
 
-      - name: Run the Spark recovery test
-        run: python tests/smoke_recovery.py
+      - name: Run smoke test
+        env:
+          PIPELINE_SMOKE_SCRIPT: ${{ matrix.script }}
+        run: python "$PIPELINE_SMOKE_SCRIPT"
